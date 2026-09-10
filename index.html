@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover" />
+<title>思花 · Sihua</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    overflow: hidden; background: #d6d6d6;
+    touch-action: none; -webkit-user-select: none; user-select: none;
+  }
+  canvas { display: block; }
+</style>
+<script src="libs/p5.min.js"></script>
+</head>
+<body>
+<script>
+// ============================================================
+// 思花 Sihua —— 垂花帘 + 穿帘蝴蝶
+// 拂过花帘的蝴蝶（和你的手指）会把悬垂的花线荡开
+// ============================================================
+
+let strands = [];
+let bgLayer = null;
+let butterfly;
+let t0 = 0;                 // 模拟起始时间（支持 ?t= 调试）
+let W = 0, H = 0, TOP = 0;
+
+const QUOTE =
+  "Among millions of people, to meet the one you meet;\n" +
+  "in the boundless wilderness of time, across the span\n" +
+  "of millennia—neither a step too soon, nor a step\n" +
+  "too late, but happening upon them just in time.";
+
+const CYCLE = 24;           // 一个完整循环秒数
+const FLY_FROM = 2;         // 蝴蝶入场时间
+const FLY_TO = 11;          // 蝴蝶离场时间
+
+// ---------- 工具 ----------
+function easeInOut(p) { return p < 0.5 ? 2*p*p : 1 - Math.pow(-2*p+2, 2)/2; }
+
+// ---------- 附着在花线上的花 / 叶 ----------
+class Item {
+  constructor(strand) {
+    this.strand = strand;
+    this.reset(true);
+  }
+  reset(initial) {
+    this.u = initial ? random(0, strand_len_n * 0.85) : -random(0.2, 2.2); // 沿线位置（粒子索引，浮点）
+    this.isFlower = random() < 0.52;
+    this.size = random(W*0.011, W*0.019);
+    this.rot = random(-0.5, 0.5);
+    this.side = random() < 0.5 ? -1 : 1;
+    this.speed = random(0.018, 0.04);    // 每秒沿线下滑比例（1.0 = 整根线）
+    this.falling = false;
+    this.x = 0; this.y = 0; this.vx = 0; this.vy = 0;
+    this.hueJ = random(-8, 10);
+    this.leafJ = random(-10, 10);
+  }
+  update(dt) {
+    if (!this.falling) {
+      this.u += this.speed * strand_len_n * dt / 60;
+      if (this.u >= strand_len_n) {
+        // 滑脱线尾，变成飘落物
+        const p = this.strand.pts[strand_len_n];
+        this.falling = true;
+        this.x = this.strand.rx[strand_len_n]; this.y = p.y;
+        this.vx = (this.strand.rx[strand_len_n] - this.strand.rx[strand_len_n - 1]) * 0.5 + random(-0.3, 0.3);
+        this.vy = 0.3;
+      }
+    } else {
+      this.vy += 0.12 * dt;
+      this.vy = Math.min(this.vy, 2.6);
+      this.vx += Math.sin(this.y * 0.02 + this.size * 9) * 0.015 * dt;
+      this.vx *= 0.995;
+      this.x += this.vx * dt;
+      this.y += this.vy * dt;
+      if (this.y > H + 60) this.reset(false);
+    }
+  }
+  pos() {
+    if (this.falling) return { x: this.x, y: this.y, tangent: 0 };
+    const u = constrain(this.u, 0, strand_len_n - 0.01);
+    const i = Math.floor(u), f = u - i;
+    const ax = this.strand.rx[i], bx = this.strand.rx[i + 1];
+    const a = this.strand.pts[i], b = this.strand.pts[i + 1];
+    const px = ax + (bx - ax) * f;
+    const py = a.y + (b.y - a.y) * f;
+    const t = Math.atan2(b.y - a.y, bx - ax) - Math.PI / 2;
+    return { x: px, y: py, tangent: t };
+  }
+  draw() {
+    const p = this.pos();
+    if (!this.falling && this.u < 0) return;
+    push();
+    translate(p.x, p.y);
+    if (this.isFlower) drawFlower(this.size, this.rot, this.hueJ);
+    else drawLeaf(this.size * 0.72, p.tangent + this.side * 0.9 + this.rot, this.side, this.leafJ);
+    pop();
+  }
+}
+
+const strand_len_n = 24;     // 每根线的粒子段数
+
+// ---------- 一根垂花线（Verlet 悬链） ----------
+class Strand {
+  constructor(anchorX, length) {
+    this.ax = anchorX;
+    this.n = strand_len_n;
+    this.seg = length / this.n;
+    this.pts = [];
+    this.fx = [];   // 蝴蝶/手指施加的水平偏移（纯视觉力场，不进物理）
+    this.rx = [];   // 渲染用 x = 物理 x + fx
+    for (let i = 0; i <= this.n; i++) {
+      const y = TOP + i * this.seg + random(-1, 1);
+      this.pts.push({ x: anchorX, y, ox: anchorX, oy: y });
+      this.fx.push(0);
+      this.rx.push(anchorX);
+    }
+    this.curl = random() < 0.18;          // 线尾是否带小卷须
+    this.items = [];
+    const k = 3 + Math.floor(random(4));  // 3–6 个花/叶
+    for (let i = 0; i < k; i++) this.items.push(new Item(this));
+  }
+  step(dt, time, idx, repellers) {
+    const damp = 0.96;
+    const g = 0.26 * H / 960;
+    for (let i = 1; i <= this.n; i++) {
+      const p = this.pts[i];
+      let vx = (p.x - p.ox) * damp;
+      let vy = (p.y - p.oy) * damp;
+      // 微风：线越靠下摆幅越大
+      vx += Math.sin(time * 0.9 + p.y * 0.012 + idx * 0.7) * 0.004 * (i / this.n);
+      // 回到垂直悬垂位置的弹簧
+      vx += (this.ax - p.x) * 0.01;
+      p.ox = p.x; p.oy = p.y;
+      p.x += vx;
+      p.y += vy + g;
+    }
+    // 距离约束
+    for (let k = 0; k < 8; k++) {
+      this.pts[0].x = this.ax; this.pts[0].y = TOP;
+      for (let i = 0; i < this.n; i++) {
+        const a = this.pts[i], b = this.pts[i + 1];
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const d = Math.hypot(dx, dy) || 0.001;
+        const diff = (d - this.seg) / d;
+        const mx = dx * 0.5 * diff, my = dy * 0.5 * diff;
+        if (i > 0) { a.x += mx; a.y += my; }
+        b.x -= mx; b.y -= my;
+      }
+    }
+    // 视觉力场：蝴蝶/手指把线向两侧拂开（椭圆作用域 + smoothstep 衰减）
+    for (let i = 0; i <= this.n; i++) {
+      const p = this.pts[i];
+      let target = 0;
+      for (const r of repellers) {
+        const dx = p.x - r.x, dy = p.y - r.y;
+        const q = Math.sqrt((dx / r.radius) ** 2 + (dy / (r.radius * 1.5)) ** 2);
+        if (q < 1) {
+          let f = 1 - q;
+          f = f * f * (3 - 2 * f);
+          target += Math.sign(dx || (i % 2 ? 1 : -1)) * f * r.amp;
+        }
+      }
+      this.fx[i] += (target - this.fx[i]) * 0.16;
+    }
+    // 沿花链做一次邻域平滑，消除力场边缘的折线
+    for (let pass = 0; pass < 2; pass++) {
+      for (let i = 1; i < this.n; i++) {
+        this.fx[i] = this.fx[i] * 0.6 + (this.fx[i - 1] + this.fx[i + 1]) * 0.2;
+      }
+    }
+    for (let i = 0; i <= this.n; i++) this.rx[i] = this.pts[i].x + this.fx[i];
+    for (const it of this.items) it.update(dt);
+  }
+  draw() {
+    // 线
+    noFill();
+    stroke(148, 168, 208, 115);
+    strokeWeight(1);
+    beginShape();
+    for (let i = 0; i <= this.n; i++) vertex(this.rx[i], this.pts[i].y);
+    endShape();
+    // 尾部小卷须
+    if (this.curl) {
+      const ex = this.rx[this.n];
+      const end = this.pts[this.n];
+      const prev = this.pts[this.n - 1];
+      const ang = Math.atan2(end.y - prev.y, this.rx[this.n] - this.rx[this.n - 1]);
+      noFill();
+      stroke(148, 168, 208, 95);
+      beginShape();
+      for (let a = 0; a < Math.PI * 1.7; a += 0.25) {
+        const rr = 5.5 * (1 - a / (Math.PI * 1.7));
+        vertex(ex + Math.cos(ang + a) * rr, end.y + Math.sin(ang + a) * rr);
+      }
+      endShape();
+    }
+  }
+  drawItems() { for (const it of this.items) it.draw(); }
+}
+
+// ---------- 小花 ----------
+function drawFlower(size, rot, hueJ) {
+  rotate(rot);
+  const petalR = 238 + hueJ, petalG = 116 + hueJ*0.4, petalB = 168;
+  for (let i = 0; i < 5; i++) {
+    push();
+    rotate(i * Math.PI * 2 / 5);
+    noStroke();
+    fill(petalR, petalG, petalB, 238);
+    ellipse(0, -size * 0.52, size * 0.58, size * 0.92);
+    fill(253, 214, 230, 235);
+    ellipse(0, -size * 0.42, size * 0.34, size * 0.55);
+    pop();
+  }
+  noStroke();
+  fill(222, 70, 128);
+  circle(0, 0, size * 0.42);
+  fill(255, 214, 120);
+  circle(0, 0, size * 0.16);
+}
+
+// ---------- 小叶 ----------
+function drawLeaf(size, ang, side, j) {
+  rotate(ang);
+  noStroke();
+  fill(128 + j*0.5, 184 + j*0.5, 76, 235);
+  ellipse(0, 0, size * 0.42, size * 0.92);
+  stroke(104, 158, 64, 190);
+  strokeWeight(0.5);
+  line(0, -size*0.38, 0, size*0.38);
+}
+
+// ---------- 蝴蝶 ----------
+class Butterfly {
+  constructor() { this.x = -100; this.y = H*0.6; this.tx = this.x; this.ty = this.y; this.dir = 1; this.active = false; this.tilt = 0; }
+  path(time) {
+    const cyc = time % CYCLE;
+    const dir = (Math.floor(time / CYCLE) % 2 === 0) ? 1 : -1;
+    if (cyc < FLY_FROM || cyc > FLY_TO + 0.5) return null;
+    const p = constrain((cyc - FLY_FROM) / (FLY_TO - FLY_FROM), 0, 1);
+    const e = easeInOut(p);
+    let x = dir > 0 ? lerp(-W*0.12, W*1.12, e) : lerp(W*1.12, -W*0.12, e);
+    let y = H * 0.60 - Math.sin(p * Math.PI * 1.25) * H * 0.055
+                + Math.sin(p * 15) * H * 0.012;
+    return { x, y, dir };
+  }
+  update(dt, time) {
+    const tgt = this.path(time);
+    if (!tgt) { this.active = false; return null; }
+    this.active = true;
+    this.dir = tgt.dir;
+    this.tx = tgt.x; this.ty = tgt.y;
+    const k = 1 - Math.pow(0.001, dt);
+    this.x += (tgt.x - this.x) * k;
+    this.y += (tgt.y - this.y) * k;
+    this.tilt = Math.atan2(tgt.y - this.y, (tgt.x - this.x) * this.dir);
+    return { x: this.x, y: this.y, radius: W*0.30, amp: W*0.22 };
+  }
+  draw(time) {
+    if (!this.active) return;
+    push();
+    translate(this.x, this.y);
+    scale(this.dir, 1);
+    rotate(this.tilt * 0.5);
+    const L = W * 0.09;
+    // 扇翅：用垂直方向的压扁模拟透视，而不是原地旋转
+    const flap = Math.sin(time * 13) * 0.5 + 0.5;
+    const fy = 0.5 + flap * 0.5;
+    noStroke();
+    // 翅膀层（受扇翅缩放影响）：身体水平，前翅占上两象限，后翅占下两象限
+    push();
+    scale(1, fy);
+    for (const sy of [-1, 1]) {
+      // 前翅（上扬，粉尖）
+      push();
+      translate(L*0.10, sy*L*0.05);
+      rotate(sy * 0.42);
+      stroke(214, 150, 182, 200);
+      strokeWeight(0.8);
+      fill(255, 253, 254, 236);
+      ellipse(L*0.15, 0, L*0.46, L*0.21);
+      noStroke();
+      fill(245, 128, 180, 235);
+      ellipse(L*0.31, 0, L*0.15, L*0.16);
+      pop();
+      // 后翅（下垂，圆小）
+      push();
+      translate(-L*0.02, sy*L*0.05);
+      rotate(sy * 0.62);
+      stroke(214, 150, 182, 190);
+      strokeWeight(0.8);
+      fill(255, 253, 254, 232);
+      ellipse(L*0.09, 0, L*0.27, L*0.18);
+      noStroke();
+      fill(245, 128, 180, 228);
+      ellipse(L*0.18, 0, L*0.10, L*0.11);
+      pop();
+    }
+    pop();
+    // 翅脉细线
+    push();
+    scale(1, fy);
+    stroke(206, 130, 165, 115);
+    strokeWeight(0.7);
+    for (const sy of [-1, 1]) {
+      line(L*0.05, sy*L*0.02, L*0.30, sy*L*0.14);
+      line(L*0.00, sy*L*0.02, L*0.16, sy*L*0.12);
+    }
+    pop();
+    // 身体与触角
+    noStroke();
+    fill(92, 72, 72);
+    ellipse(L*0.02, 0, L*0.42, L*0.05);
+    fill(70, 55, 55);
+    circle(L*0.24, 0, L*0.065);
+    stroke(90, 70, 70, 200);
+    strokeWeight(0.8);
+    noFill();
+    arc(L*0.26, -L*0.01, L*0.16, L*0.10, -PI*0.75, -PI*0.15);
+    arc(L*0.26,  L*0.01, L*0.16, L*0.10,  PI*0.15,  PI*0.75);
+    pop();
+  }
+}
+
+// ---------- 背景 ----------
+function buildBackground() {
+  bgLayer = createGraphics(W, H);
+  const ctx = bgLayer.drawingContext;
+  const g = ctx.createRadialGradient(W/2, H*0.42, H*0.1, W/2, H*0.5, H*0.85);
+  g.addColorStop(0, '#fbfbfa');
+  g.addColorStop(0.65, '#f0f0ef');
+  g.addColorStop(1, '#d3d3d3');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+}
+
+// ---------- p5 生命周期 ----------
+function setup() {
+  W = windowWidth; H = windowHeight;
+  createCanvas(W, H);
+  pixelDensity(Math.min(2, window.devicePixelRatio || 1));
+  buildBackground();
+  TOP = H * 0.075;
+  const n = Math.round(W / (W * 0.016));   // 线间距 ≈ 屏宽 1.6%
+  const x0 = W * 0.06, x1 = W * 0.94;
+  for (let i = 0; i < n; i++) {
+    const t = n === 1 ? 0.5 : i / (n - 1);
+    const ax = lerp(x0, x1, t) + random(-W*0.006, W*0.006);
+    const length = H * random(0.76, 0.86);
+    strands.push(new Strand(ax, length));
+  }
+  butterfly = new Butterfly();
+  // ?t= 调试：把模拟时钟精确拨到指定秒数（先补跑物理再首帧渲染）
+  const params = new URLSearchParams(window.location.search);
+  const off = parseFloat(params.get('t') || '0');
+  if (off > 0) {
+    for (let f = 0; f < Math.round(off * 60); f++) {
+      const time = f / 60;
+      const reps = [];
+      const br = butterfly.update(1, time);
+      if (br) reps.push(br);
+      for (let i = 0; i < strands.length; i++) strands[i].step(1, time, i, reps);
+    }
+  }
+  t0 = millis() / 1000 - off;
+}
+
+function windowResized() {
+  W = windowWidth; H = windowHeight;
+  resizeCanvas(W, H);
+  buildBackground();
+}
+
+function draw() {
+  const time = millis() / 1000 - t0;
+  const dt = Math.min(deltaTime / 1000, 0.05) * 60; // 以 60fps 为单位
+  image(bgLayer, 0, 0);
+
+  const repellers = [];
+  const br = butterfly.update(dt, time);
+  if (br) repellers.push(br);
+  if (mouseIsPressed || (touches && touches.length)) {
+    const px = touches && touches.length ? touches[0].x : mouseX;
+    const py = touches && touches.length ? touches[0].y : mouseY;
+    repellers.push({ x: px, y: py, radius: W*0.18, amp: W*0.26 });
+  }
+
+  for (let i = 0; i < strands.length; i++) strands[i].step(dt, time, i, repellers);
+  for (const s of strands) s.draw();
+  for (const s of strands) s.drawItems();
+  butterfly.draw(time);
+  drawQuote(time);
+}
+
+function drawQuote(time) {
+  const chars = Math.floor(constrain(time / 9, 0, 1) * QUOTE.length);
+  if (chars <= 0) return;
+  push();
+  textAlign(CENTER, CENTER);
+  textFont('Courier New, monospace');
+  textSize(W * 0.0155);
+  fill(115, 115, 128, 52);
+  noStroke();
+  text(QUOTE.slice(0, chars), W/2, H*0.47, W*0.76);
+  pop();
+}
+</script>
+</body>
+</html>
